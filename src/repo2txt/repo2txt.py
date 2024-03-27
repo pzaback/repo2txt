@@ -97,11 +97,15 @@ def parse_args():
         default=None,
         help="Specific directory to include. Only contents of this directory will be documented.",
     )
-
+    parser.add_argument(
+        "--use-gitignore",
+        action="store_true",
+        help="Flag to use .gitignore file patterns to exclude files and directories.",
+    )
     return parser.parse_args()
 
 
-def should_ignore(item, args, output_file_path):
+def should_ignore(item, args, output_file_path, gitignore_patterns):
     """
     Determine if a given item should be ignored based on the script's arguments.
 
@@ -109,6 +113,7 @@ def should_ignore(item, args, output_file_path):
         item (str): The path of the item (file or directory) to check.
         args (argparse.Namespace): Parsed command-line arguments.
         output_file_path (str): The path of the output file being written to.
+        gitignore_patterns (list): List of patterns from .gitignore file.
 
     Returns:
         bool: True if the item should be ignored, False otherwise.
@@ -120,10 +125,6 @@ def should_ignore(item, args, output_file_path):
     # Ensure the comparison is between path strings
     if os.path.abspath(item) == os.path.abspath(output_file_path):
         return True
-
-    # Adjust logic to handle hidden files and directories correctly
-    if item_name.startswith("."):
-        return True  # Ignore all hidden files and directories
 
     if os.path.isdir(item) and args.exclude_dir and item_name in args.exclude_dir:
         return True
@@ -141,10 +142,49 @@ def should_ignore(item, args, output_file_path):
     if args.ignore_settings and file_ext in SETTINGS_EXTENSIONS:
         return True
 
+    if args.use_gitignore:
+        for pattern in gitignore_patterns:
+            if os.path.relpath(item, start=args.repo_path).startswith(
+                tuple(pattern.split("/"))
+            ):
+                return True
+
     return False
 
 
-def write_tree(dir_path, output_file, args, prefix="", is_last=True, is_root=True):
+def load_gitignore_patterns(repo_path):
+    """
+    Load .gitignore patterns from the specified repository path.
+
+    Args:
+        repo_path (str): Path to the repository directory.
+
+    Returns:
+        list: List of patterns from the .gitignore file.
+    """
+    gitignore_path = os.path.join(repo_path, ".gitignore")
+    patterns = []
+
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, "r", encoding="utf-8") as gitignore_file:
+            patterns = [
+                pattern.strip()
+                for pattern in gitignore_file.readlines()
+                if pattern.strip() and not pattern.strip().startswith("#")
+            ]
+
+    return patterns
+
+
+def write_tree(
+    dir_path,
+    output_file,
+    args,
+    gitignore_patterns,
+    prefix="",
+    is_last=True,
+    is_root=True,
+):
     """
     Recursively write the directory tree to the output file, including the root directory name.
 
@@ -152,6 +192,7 @@ def write_tree(dir_path, output_file, args, prefix="", is_last=True, is_root=Tru
         dir_path (str): The path of the directory to document.
         output_file (file object): The file object to write to.
         args (argparse.Namespace): Parsed command-line arguments.
+        gitignore_patterns (list): List of patterns from .gitignore file.
         prefix (str): Prefix string for line indentation and structure. Defaults to "".
         is_last (bool): Flag to indicate if the item is the last in its level. Defaults to True.
         is_root (bool): Flag to indicate if the current directory is the root. Defaults to True.
@@ -168,7 +209,7 @@ def write_tree(dir_path, output_file, args, prefix="", is_last=True, is_root=Tru
     for index, item in enumerate(items):
         item_path = os.path.join(dir_path, item)
 
-        if should_ignore(item_path, args, args.output_file):
+        if should_ignore(item_path, args, args.output_file, gitignore_patterns):
             continue
 
         is_last_item = index == num_items - 1
@@ -180,7 +221,13 @@ def write_tree(dir_path, output_file, args, prefix="", is_last=True, is_root=Tru
         if os.path.isdir(item_path):
             next_prefix = prefix + child_prefix
             write_tree(
-                item_path, output_file, args, next_prefix, is_last_item, is_root=False
+                item_path,
+                output_file,
+                args,
+                gitignore_patterns,
+                next_prefix,
+                is_last_item,
+                is_root=False,
             )
 
 
@@ -203,7 +250,9 @@ def write_file_content(file_path, output_file, depth):
         output_file.write(f"{indentation}Error reading file: {e}\n")
 
 
-def write_file_contents_in_order(dir_path, output_file, args, depth=0):
+def write_file_contents_in_order(
+    dir_path, output_file, args, gitignore_patterns, depth=0
+):
     """
     Recursively document the contents of files in the order they appear in the directory tree.
 
@@ -211,12 +260,15 @@ def write_file_contents_in_order(dir_path, output_file, args, depth=0):
         dir_path (str): The path of the directory to start documenting from.
         output_file (file object): The file object to write the contents to.
         args (argparse.Namespace): Parsed command-line arguments.
+        gitignore_patterns (list): List of patterns from .gitignore file.
         depth (int): Current depth in the directory tree. Defaults to 0.
     """
     items = sorted(
         item
         for item in os.listdir(dir_path)
-        if not should_ignore(os.path.join(dir_path, item), args, args.output_file)
+        if not should_ignore(
+            os.path.join(dir_path, item), args, args.output_file, gitignore_patterns
+        )
     )
 
     for item in items:
@@ -224,7 +276,9 @@ def write_file_contents_in_order(dir_path, output_file, args, depth=0):
         relative_path = os.path.relpath(item_path, start=args.repo_path)
 
         if os.path.isdir(item_path):
-            write_file_contents_in_order(item_path, output_file, args, depth + 1)
+            write_file_contents_in_order(
+                item_path, output_file, args, gitignore_patterns, depth + 1
+            )
         elif os.path.isfile(item_path):
             output_file.write("  " * depth + f"[File Begins] {relative_path}\n")
             write_file_content(item_path, output_file, depth)
@@ -251,6 +305,11 @@ def main():
     )
     args.exclude_dir = [] if args.exclude_dir == ["none"] else args.exclude_dir
 
+    # Load .gitignore patterns
+    gitignore_patterns = (
+        load_gitignore_patterns(args.repo_path) if args.use_gitignore else []
+    )
+
     # Check if the provided directory path is valid
     if not os.path.isdir(args.repo_path):
         print(
@@ -271,10 +330,20 @@ def main():
         )
 
         output_file.write("Directory/File Tree Begins -->\n\n")
-        write_tree(args.repo_path, output_file, args, "", is_last=True, is_root=True)
+        write_tree(
+            args.repo_path,
+            output_file,
+            args,
+            gitignore_patterns,
+            "",
+            is_last=True,
+            is_root=True,
+        )
         output_file.write("\n<-- Directory/File Tree Ends")
         output_file.write("\n\nFile Content Begin -->\n")
-        write_file_contents_in_order(args.repo_path, output_file, args)
+        write_file_contents_in_order(
+            args.repo_path, output_file, args, gitignore_patterns
+        )
         output_file.write("\n<-- File Content Ends\n\n")
 
 
